@@ -8,87 +8,183 @@ import esclient
 import json
 import argparse
 import sys
+import time
+import threading
 
+class ESDump:
 
-parser = argparse.ArgumentParser(description="Dump one or more ElasticSearch" +
-" indexes to stdout. This tool will dump all the _source fields. If you chose"+
-" not to store the _source field, you can not make backups of your index(es)"+
-" with this tool.")
+    def __init__(self, arguments):
+        
+        if not arguments.indexes:
+            indexes = ['_all']
+        else:
+            indexes = arguments.indexes
 
-parser.add_argument('--url', '-u', required=True, help="The full URL to the ElasticSearch server, including port")
-parser.add_argument('--file', '-f', required=False, help="The output file to dump to. By default esdump will dump to stdout.")
-parser.add_argument('--indexes', '-i', nargs='+', help="One or more index names to dump, may also be aliases. If none specified, ALL indexes are dumped.")
-parser.add_argument('--gzip', '-z', action="store_true", help="Use gzip to compress the output")
-parser.add_argument('--bzip2', '-b', action="store_true", help="Use bzip2 to compress the output")
-parser.add_argument('--stored-fields', '-s', nargs='+', help="A list of fields that you want to include in the backup (_source, _id, _parent and _routing are included automatically")
+        if arguments.bzip2 and arguments.gzip:
+            sys.stderr.write("Invalid combination of options: I can write either bzip2 or gzip, not both.\n")
+            sys.exit(1)
+         
+        self.es = esclient.ESClient(arguments.url)
 
-arguments = parser.parse_args()
+        # TODO: check cluster state before continuing
 
-if not arguments.indexes:
-    indexes = ['_all']
-else:
-    indexes = arguments.indexes
+        # Open a file to write to, based on the arguments given 
+        if arguments.bzip2 and arguments.file:
+            import bz2
+            self.f = bz2.BZ2File(arguments.file, 'wb')
+        elif arguments.gzip and arguments.file:
+            import gzip
+            self.f = gzip.open(arguments.file, 'wb')
+        elif arguments.file:
+            self.f = open(arguments.file, "w")
+        else:
+            if arguments.bzip2 or arguments.gzip:
+                sys.stderr.write("This tool will not write compressed output to stdout. You can however pipe the output through gzip or bzip2 to compress the data.\n")
+                sys.exit(1)
+            else:    
+                # use stdout as a file
+                self.f = sys.stdout
+                
+        # Get the fields that the user wants to backup in addition to the system fields as listed below
+        fields = set(["_parent", "_routing", "_source"])
+        if arguments.stored_fields:
+            for field in arguments.stored_fields:
+                fields.add(field)
+        fields = list(fields)
 
-if arguments.bzip2 and arguments.gzip:
-    sys.stderr.write("Invalid combination of options: I can write either bzip2 or gzip, not both.\n")
-    sys.exit(1)
- 
-es = esclient.ESClient(arguments.url)
+        query_body = { "query": { "match_all": {} }, "fields": fields }
+        self.scroll_id = self.es.scan(query_body = query_body, indexes = indexes)
 
-# TODO: check cluster state before continuing
+        self.indexes = set()
+        self.args = arguments
 
-# Open a file to write to, based on the arguments given 
-if arguments.bzip2 and arguments.file:
-    import bz2
-    f = bz2.BZ2File(arguments.file, 'wb')
-elif arguments.gzip and arguments.file:
-    import gzip
-    f = gzip.open(arguments.file, 'wb')
-elif arguments.file:
-    f = open(arguments.file, "w")
-else:
-    if arguments.bzip2 or arguments.gzip:
-        sys.stderr.write("This tool will not write compressed output to stdout. You can however pipe the output through gzip or bzip2 to compress the data.\n")
-        sys.exit(1)
-    else:    
-        # use stdout as a file
-        f = sys.stdout
+    def start(self, background=False):
+        #set soem vars
+        self.threads = dict()
+        self.scrollBlocks = dict()
+        self.jsonBlocks = dict()
+        self.totalDocs = 0
+        self.docsDone = 0
+        self.jsonDone = False
+        self.writeDone = False
+        
+        #fork the threads needed
+        self.threads['scroll'] = threading.Thread(target=self.scroll)
+        self.threads['scroll'].daemon = True
+        self.threads['scroll'].start()
+        
+        self.threads['json'] = threading.Thread(target=self.json_dump)
+        self.threads['json'].daemon = True
+        self.threads['json'].start()
+        
+        self.threads['write'] = threading.Thread(target=self.write)
+        self.threads['write'].daemon = True
+        self.threads['write'].start()
+        
+        while True:
+                
+            try:
+                sys.stderr.write("("+str(self.docsDone)+"/"+str(self.totalDocs)+") = "+str((float(self.docsDone)/float(self.totalDocs))*100)+"%\n")
+            except:
+                pass
+                
+            
+            if self.writeDone == True:
+                exit(0)
+                
+            time.sleep(10)
     
+    def write(self):
+        counter = 0
+        while True:
+            if self.jsonBlocks.has_key(counter) == True:
+                if self.jsonBlocks[counter] != None:
+                    if self.jsonDone == True:
+                        sys.stderr.write("Writing remaing chunks to disk: "+str(len(self.jsonBlocks)-counter)+"\n")
+                    self.f.write(self.jsonBlocks[counter])
+                    del self.jsonBlocks[counter]
+                    counter+=1
+                    
+                else:
+                    break #we are done here
+            else:
+                #sys.stderr.write("Waiting on Json to encode more data\n")
+                time.sleep(1)
+                
+        sys.stderr.write("Starting disk flush\n")
+        self.f.flush() #make sure we have flushed this to disk
+        self.f.close()
+        self.writeDone = True
+        
+    def json_dump(self):
+        counter = 0
+        while True:
+            jsonBlock = ""
+            if self.scrollBlocks.has_key(counter) == True:
+                if self.scrollBlocks[counter] != None: #if its None then we are done
+                    for doc in self.scrollBlocks[counter]['hits']['hits']:
+                        if doc["_index"] not in self.indexes:
+                            self.indexes.add(doc["_index"])
+                        
+                        del(doc["_score"]) #scroll does not return _score
+                        self.docsDone+=1 #up the doc counter   
+                        jsonBlock+=json.dumps(doc)+'\n'
+                        
+                    self.jsonBlocks[counter]=jsonBlock
+                    jsonBlock = ""
+                    del self.scrollBlocks[counter] #del the one we just finished
+                    counter+=1 #up the counter
+                    
+                else:
+                    self.jsonBlocks[counter] = None #pass the end down stream
+                    self.jsonDone = True
+                    sys.stderr.write("Done with json encoding\nDo not close yet because we have to wait for things to be written to disk\n")
+                    break #we are done
+            else:
+                #sys.stderr.write("Waiting for the scroller to get more results\n")
+                time.sleep(1)
+        
+    def scroll(self):
+        counter = 0
+        while True:
+            if len(self.scrollBlocks) < 9: #if we have to many lets wait so we dont blow up ram
+                scroller = self.es.scroll(self.scroll_id)
+                #print scroller
+                #exit()
+                self.totalDocs = scroller['hits']['total']
+                if len(scroller['hits']['hits']) > 0:
+                    self.scrollBlocks[counter] = scroller.copy()
+                    self.scroll_id = self.scrollBlocks[counter]["_scroll_id"] # get next scroll_id
+                
+                else: #we are done scrolling
+                    sys.stderr.write("Scrolling the database is done\n")
+                    self.scrollBlocks[counter] = None
+                    break
+                
+                counter+=1 #up the counter
+                
+            else:
+                #sys.stderr.write("Scroll queue is full waiting\n")
+                time.sleep(1)
+                
+        
+        # TODO
+        # write_mappings(indexes)
 
-# Get the fields that the user wants to backup in addition to the system fields as listed below
-fields = set(["_parent", "_routing", "_source"])
-if arguments.stored_fields:
-    for field in arguments.stored_fields:
-        fields.add(field)
-fields = list(fields)
+if __name__=="__main__":
+    parser = argparse.ArgumentParser(description="Dump one or more ElasticSearch" +
+    " indexes to stdout. This tool will dump all the _source fields. If you chose"+
+    " not to store the _source field, you can not make backups of your index(es)"+
+    " with this tool.")
 
-query_body = { "query": { "match_all": {} }, "fields": fields }
-scroll_id = es.scan(query_body = query_body, indexes = indexes)
+    parser.add_argument('--url', '-u', required=True, help="The full URL to the ElasticSearch server, including port")
+    parser.add_argument('--file', '-f', required=False, help="The output file to dump to. By default esdump will dump to stdout.")
+    parser.add_argument('--indexes', '-i', nargs='+', help="One or more index names to dump, may also be aliases. If none specified, ALL indexes are dumped.")
+    parser.add_argument('--gzip', '-z', action="store_true", help="Use gzip to compress the output")
+    parser.add_argument('--bzip2', '-b', action="store_true", help="Use bzip2 to compress the output")
+    parser.add_argument('--stored-fields', '-s', nargs='+', help="A list of fields that you want to include in the backup (_source, _id, _parent and _routing are included automatically")
 
-indexes = set()
-
-while True:
-    scrollres = es.scroll(scroll_id)
-    # get next scroll_id
-    scroll_id = scrollres["_scroll_id"]
+    arguments = parser.parse_args()
+    dump = ESDump(arguments)
+    dump.start()
     
-    hits = scrollres["hits"]["hits"]
-
-    num_results = 0
-    for hit in scrollres["hits"]["hits"]:
-        # Delete this field, since it is useless for restore purposes
-        del(hit["_score"])
-        if hit["_index"] not in indexes:
-            indexes.add(hit["_index"])
-
-        f.write(json.dumps(hit))
-        f.write('\n')
-        num_results += 1
-
-    # See if we reached the end of the data
-    if num_results == 0:
-        break
-# TODO
-# write_mappings(indexes)
-
-f.close()

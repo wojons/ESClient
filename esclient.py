@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 
 __author__ = 'Erik-Jan van Baaren'
 __all__ = ['ESClient']
-__version__ = (0, 5, 6)
+__version__ = (0, 5, 7)
 
 
 def get_version():
