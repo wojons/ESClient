@@ -109,7 +109,7 @@ class ESDump:
                     break #we are done here
             else:
                 #sys.stderr.write("Waiting on Json to encode more data\n")
-                time.sleep(1)
+                time.sleep(10)
                 
         sys.stderr.write("Starting disk flush\n")
         self.f.flush() #make sure we have flushed this to disk
@@ -142,7 +142,7 @@ class ESDump:
                     break #we are done
             else:
                 #sys.stderr.write("Waiting for the scroller to get more results\n")
-                time.sleep(1)
+                time.sleep(5)
         
     def scroll(self):
         counter = 0
